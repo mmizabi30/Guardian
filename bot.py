@@ -1,22 +1,26 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
 Guardian Telegram Bot (Web Service + Polling)
+
+ویژگی‌ها:
 - فقط در یک گروهِ تعیین‌شده فعال می‌شود
 - پیام‌های عکس / ویدیو / گیف / استیکر / ویدیو نوت را حذف می‌کند
 - فقط ویس را اجازه می‌دهد
 - لینک‌ها را حذف می‌کند، به‌جز لینک‌های start برای همین بات
 - فیلتر کلمات دارد
-- کاربران ویژه (با ریپلای ادمین) می‌توانند sticker / animation / video_note بفرستند
-- همه تنظیمات در Neon/PostgreSQL ذخیره می‌شود
+- کاربر ویژه با «تنظیم ویژه» / «حذف ویژه» (روی پیام کاربر با ریپلای)
+- ادمین اصلی + ادمین‌های اضافه‌شده از پنل خصوصی
+- ذخیره همه تنظیمات در Neon/PostgreSQL
 - بدون webhook اجرا می‌شود، ولی برای Render Web Service یک HTTP health endpoint دارد
 
 اجرا:
-  pip install -r requirements.txt
+  pip install -r requirements_web.txt
   export BOT_TOKEN="123456:ABC..."
   export DATABASE_URL="postgresql://..."
-  python guardian_bot_web.py
+  python guardian_bot_web_ready.py
 
 نکته:
   بات باید در گروه هدف ادمین باشد و اجازه حذف پیام داشته باشد.
@@ -27,6 +31,7 @@ import json
 import logging
 import os
 import re
+from html import escape as html_escape
 from typing import Any, Optional
 
 import asyncpg
@@ -41,13 +46,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # تنظیمات اصلی
 # =====================
 
-ADMIN_ID = int(os.getenv("OWNER_ID", "8883527571"))
+OWNER_ID = int(os.getenv("OWNER_ID", "8883527571"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-# این مقدار در startup از خود بات خوانده می‌شود؛ فقط به‌عنوان fallback است
+# اگر خود بات بالا آمد، یوزرنیمش از getMe خوانده می‌شود؛ این فقط fallback است
 ALLOWED_BOT_USERNAME = os.getenv("ALLOWED_BOT_USERNAME", "").strip()
+
+MENTION_CHUNK_LIMIT = 3200  # برای امن ماندن زیر محدودیت تلگرام
 
 # =====================
 # لاگ
@@ -70,7 +77,7 @@ router = Router()
 
 
 # =====================
-# ابزارهای دیتابیس
+# دیتابیس
 # =====================
 
 async def db_exec(query: str, *args):
@@ -116,6 +123,27 @@ async def init_db() -> None:
                 first_name TEXT,
                 username TEXT,
                 added_at TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                added_at TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_members (
+                user_id BIGINT PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                full_name TEXT,
+                last_seen TIMESTAMPTZ DEFAULT NOW()
             )
             """
         )
@@ -203,9 +231,64 @@ async def db_is_special_user(user_id: int) -> bool:
     return row is not None
 
 
-async def db_set_admin_state(state: Optional[str], payload: Optional[dict[str, Any]] = None) -> None:
+async def db_add_admin(user_id: int, first_name: str | None, username: str | None) -> None:
+    if user_id == OWNER_ID:
+        return
+    await db_exec(
+        """
+        INSERT INTO admins(user_id, first_name, username)
+        VALUES($1, $2, $3)
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = EXCLUDED.first_name,
+            username = EXCLUDED.username
+        """,
+        user_id,
+        first_name,
+        username,
+    )
+
+
+async def db_remove_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return False
+    result = await db_exec("DELETE FROM admins WHERE user_id = $1", user_id)
+    return result.endswith(" 1")
+
+
+async def db_list_admins() -> list[dict[str, Any]]:
+    rows = await db_fetch("SELECT user_id, first_name, username, added_at FROM admins ORDER BY added_at DESC")
+    admins = [
+        {
+            "user_id": OWNER_ID,
+            "first_name": "OWNER",
+            "username": None,
+            "added_at": None,
+            "owner": True,
+        }
+    ]
+    for row in rows:
+        admins.append(
+            {
+                "user_id": int(row["user_id"]),
+                "first_name": row["first_name"],
+                "username": row["username"],
+                "added_at": row["added_at"],
+                "owner": False,
+            }
+        )
+    return admins
+
+
+async def db_is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    row = await db_fetchrow("SELECT 1 FROM admins WHERE user_id = $1 LIMIT 1", user_id)
+    return row is not None
+
+
+async def db_set_admin_state(admin_id: int, state: Optional[str], payload: Optional[dict[str, Any]] = None) -> None:
     if state is None:
-        await db_exec("DELETE FROM admin_state WHERE admin_id = $1", ADMIN_ID)
+        await db_exec("DELETE FROM admin_state WHERE admin_id = $1", admin_id)
         return
 
     payload_json = json.dumps(payload or {}, ensure_ascii=False)
@@ -216,16 +299,16 @@ async def db_set_admin_state(state: Optional[str], payload: Optional[dict[str, A
             state = EXCLUDED.state,
             payload = EXCLUDED.payload
         """,
-        ADMIN_ID,
+        admin_id,
         state,
         payload_json,
     )
 
 
-async def db_get_admin_state() -> tuple[Optional[str], dict[str, Any]]:
+async def db_get_admin_state(admin_id: int) -> tuple[Optional[str], dict[str, Any]]:
     row = await db_fetchrow(
         "SELECT state, payload FROM admin_state WHERE admin_id = $1",
-        ADMIN_ID,
+        admin_id,
     )
     if not row:
         return None, {}
@@ -236,6 +319,30 @@ async def db_get_admin_state() -> tuple[Optional[str], dict[str, Any]]:
         except Exception:
             payload = {}
     return row["state"], payload
+
+
+async def db_add_group_member(user_id: int, first_name: str | None, username: str | None, full_name: str | None) -> None:
+    await db_exec(
+        """
+        INSERT INTO group_members(user_id, first_name, username, full_name, last_seen)
+        VALUES($1, $2, $3, $4, NOW())
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = EXCLUDED.first_name,
+            username = EXCLUDED.username,
+            full_name = EXCLUDED.full_name,
+            last_seen = NOW()
+        """,
+        user_id,
+        first_name,
+        username,
+        full_name,
+    )
+
+
+async def db_list_group_members() -> list[asyncpg.Record]:
+    return await db_fetch(
+        "SELECT user_id, first_name, username, full_name, last_seen FROM group_members ORDER BY last_seen DESC"
+    )
 
 
 # =====================
@@ -250,6 +357,12 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().casefold())
 
 
+def normalize_action_text(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"^[\s\(\[\{«\"'']+|[\s\)\]\}»\"'']+$", "", t)
+    return re.sub(r"\s+", " ", t).casefold()
+
+
 def safe_int(text: str) -> Optional[int]:
     try:
         return int(str(text).strip())
@@ -258,7 +371,19 @@ def safe_int(text: str) -> Optional[int]:
 
 
 def is_rules_trigger(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*قوانین\s*", text or ""))
+    return normalize_action_text(text) == "قوانین"
+
+
+def is_tag_command(text: str) -> bool:
+    return normalize_action_text(text) == "تگ"
+
+
+def is_special_add_command(text: str) -> bool:
+    return normalize_action_text(text) == "تنظیم ویژه"
+
+
+def is_special_remove_command(text: str) -> bool:
+    return normalize_action_text(text) == "حذف ویژه"
 
 
 def iter_message_entities(message: Message):
@@ -281,15 +406,19 @@ def entity_url(text: str, ent) -> Optional[str]:
     return None
 
 
+def bot_username_for_links() -> str:
+    return runtime_bot_username or ALLOWED_BOT_USERNAME or ""
+
+
 def is_allowed_bot_start_link(url: str) -> bool:
     if not url:
         return False
 
-    url = url.strip().rstrip(".,;!؟?)]}»\"'")
-    username = runtime_bot_username or ALLOWED_BOT_USERNAME
+    username = bot_username_for_links()
     if not username:
         return False
 
+    url = url.strip().rstrip(".,;!؟?)]}»\"'")
     pattern = re.compile(
         rf"^(?:https?://)?(?:t\.me|telegram\.me)/{re.escape(username)}\?start=[A-Za-z0-9_\-]+$",
         re.IGNORECASE,
@@ -304,9 +433,42 @@ def has_disallowed_link(message: Message) -> bool:
         url = entity_url(text, ent)
         if not url:
             continue
-        if not is_allowed_bot_start_link(url):
+        if not (is_allowed_bot_start_link(url) or is_allowed_user_mention_link(url)):
             return True
     return False
+
+
+def has_username_mention(message: Message) -> bool:
+    text = f"{message.text or ''} {message.caption or ''}"
+
+    # visible @username
+    if re.search(r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{5,32}\b", text):
+        return True
+
+    # Telegram parsed mentions by username
+    for _, _, ent in iter_message_entities(message):
+        if ent.type == MessageEntityType.MENTION:
+            return True
+
+    return False
+
+
+def has_explicit_user_id(message: Message) -> bool:
+    text = normalize_text(f"{message.text or ''} {message.caption or ''}")
+
+    if "tg://user?id=" in text:
+        return False
+
+    # الگوهای رایج برای ارسال آیدی
+    patterns = [
+        r"\b(?:id|user id|آیدی|ایدی)\b\s*[:：\-]?\s*\d{5,}",
+        r"\b(?:tg id|telegram id)\b\s*[:：]?\s*\d{5,}",
+    ]
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def has_disallowed_user_identifier(message: Message) -> bool:
+    return has_username_mention(message) or has_explicit_user_id(message)
 
 
 async def has_filter_match(message: Message) -> bool:
@@ -333,6 +495,32 @@ def is_blocked_media(message: Message, special: bool) -> bool:
     return False
 
 
+def format_hidden_mentions(user_ids: list[int]) -> str:
+    return " ".join(f'<a href="tg://user?id={uid}">•</a>' for uid in user_ids)
+
+
+def chunk_user_ids_for_mentions(user_ids: list[int], max_chars: int = MENTION_CHUNK_LIMIT) -> list[list[int]]:
+    chunks: list[list[int]] = []
+    current: list[int] = []
+    current_len = 0
+
+    for uid in user_ids:
+        token = f'<a href="tg://user?id={uid}">•</a>'
+        add_len = len(token) + 1
+        if current and current_len + add_len > max_chars:
+            chunks.append(current)
+            current = [uid]
+            current_len = len(token)
+        else:
+            current.append(uid)
+            current_len += add_len
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
 async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -340,22 +528,16 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
         log.warning("delete_message failed chat=%s msg=%s err=%s", chat_id, message_id, e)
 
 
-async def is_user_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
-    except Exception:
-        return False
-
-
-def kb_main_menu() -> InlineKeyboardMarkup:
+def kb_main_menu(is_owner: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="تنظیم گروه", callback_data="menu:set_group")
     kb.button(text="تنظیمات فیلتر", callback_data="menu:filters")
     kb.button(text="متن قوانین", callback_data="menu:rules")
     kb.button(text="لیست کاربران ویژه", callback_data="menu:specials")
+    if is_owner:
+        kb.button(text="مدیریت ادمین‌ها", callback_data="menu:admins")
     kb.button(text="گروه فعال", callback_data="menu:show_group")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -375,6 +557,16 @@ def kb_special_menu() -> InlineKeyboardMarkup:
     kb.button(text="لیست ویژه", callback_data="special:list")
     kb.button(text="بازگشت", callback_data="menu:home")
     kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+def kb_admin_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="افزودن ادمین", callback_data="admin:add")
+    kb.button(text="لیست ادمین‌ها", callback_data="admin:list")
+    kb.button(text="حذف ادمین", callback_data="admin:remove")
+    kb.button(text="بازگشت", callback_data="menu:home")
+    kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -411,8 +603,19 @@ async def fmt_specials_text() -> str:
     for r in rows:
         name = r["first_name"] or "بدون نام"
         username = f"@{r['username']}" if r["username"] else "-"
-        lines.append(f"• {name} | {username} | {r['user_id']}")
+        lines.append(f"• {html_escape(name)} | {html_escape(username)} | {r['user_id']}")
     return "کاربران ویژه:\n" + "\n".join(lines)
+
+
+async def fmt_admins_text() -> str:
+    admins = await db_list_admins()
+    lines = []
+    for a in admins:
+        name = a["first_name"] or "بدون نام"
+        username = f"@{a['username']}" if a["username"] else "-"
+        role = "مالک اصلی" if a.get("owner") else "ادمین"
+        lines.append(f"• {html_escape(name)} | {html_escape(username)} | {a['user_id']} | {role}")
+    return "ادمین‌ها:\n" + "\n".join(lines)
 
 
 async def get_allowed_target_chat_id() -> Optional[int]:
@@ -424,28 +627,62 @@ async def get_rules_text() -> str:
     return await db_get_setting("rules_text", "متن قوانین هنوز تنظیم نشده است.") or "متن قوانین هنوز تنظیم نشده است."
 
 
+async def get_owner_id(message: Message) -> int:
+    return message.from_user.id if message.from_user else 0
+
+
+async def parse_admin_target_from_message(message: Message) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    از پیام خصوصی ادمین برای افزودن/حذف ادمین استفاده می‌شود.
+    """
+    user_id: Optional[int] = None
+    first_name: Optional[str] = None
+    username: Optional[str] = None
+
+    if getattr(message, "forward_from", None):
+        fwd = message.forward_from
+        user_id = int(fwd.id)
+        first_name = fwd.first_name
+        username = fwd.username
+
+    elif getattr(message, "forward_origin", None):
+        origin = message.forward_origin
+        user = getattr(origin, "user", None)
+        if user and getattr(user, "id", None) is not None:
+            user_id = int(user.id)
+            first_name = getattr(user, "first_name", None)
+            username = getattr(user, "username", None)
+
+    if user_id is None:
+        user_id = safe_int(message.text or "")
+
+    return user_id, first_name, username
+
+
 # =====================
-# پردازش چت خصوصی ادمین
+# پنل خصوصی ادمین
 # =====================
 
 async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not message.from_user or not await db_is_admin(message.from_user.id):
         return False
 
-    state, _payload = await db_get_admin_state()
+    user_id = message.from_user.id
+    is_owner = user_id == OWNER_ID
+    state, _payload = await db_get_admin_state(user_id)
     text = (message.text or "").strip()
 
     if text in {"/start", "/panel", "پنل", "منو"} and not state:
         await message.answer(
             "پنل مدیریت بات:\n"
-            "از دکمه‌ها برای تنظیم گروه، فیلترها، متن قوانین و کاربران ویژه استفاده کن.",
-            reply_markup=kb_main_menu(),
+            "از دکمه‌ها برای تنظیم گروه، فیلترها، متن قوانین، کاربران ویژه و ادمین‌ها استفاده کن.",
+            reply_markup=kb_main_menu(is_owner),
         )
         return True
 
     if text == "/cancel":
-        await db_set_admin_state(None)
-        await message.answer("عملیات جاری لغو شد.", reply_markup=kb_main_menu())
+        await db_set_admin_state(user_id, None)
+        await message.answer("عملیات جاری لغو شد.", reply_markup=kb_main_menu(is_owner))
         return True
 
     if state == "await_group_id":
@@ -481,10 +718,10 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
         else:
             await db_del_setting("target_chat_title")
 
-        await db_set_admin_state(None)
+        await db_set_admin_state(user_id, None)
         await message.answer(
             f"گروه با موفقیت تنظیم شد.\n{await fmt_group_text()}",
-            reply_markup=kb_main_menu(),
+            reply_markup=kb_main_menu(is_owner),
         )
         return True
 
@@ -495,8 +732,8 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
             return True
 
         await db_set_setting("rules_text", rules_text)
-        await db_set_admin_state(None)
-        await message.answer("متن قوانین ذخیره شد.", reply_markup=kb_main_menu())
+        await db_set_admin_state(user_id, None)
+        await message.answer("متن قوانین ذخیره شد.", reply_markup=kb_main_menu(is_owner))
         return True
 
     if state == "await_filter_add":
@@ -506,9 +743,9 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
             return True
 
         added = await db_add_filter(word)
-        await db_set_admin_state(None)
+        await db_set_admin_state(user_id, None)
         msg = f"فیلتر اضافه شد: {word}" if added else f"این فیلتر از قبل وجود دارد: {word}"
-        await message.answer(msg, reply_markup=kb_main_menu())
+        await message.answer(msg, reply_markup=kb_main_menu(is_owner))
         return True
 
     if state == "await_filter_remove":
@@ -518,13 +755,48 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
             return True
 
         removed = await db_remove_filter(word)
-        await db_set_admin_state(None)
+        await db_set_admin_state(user_id, None)
         msg = f"فیلتر حذف شد: {word}" if removed else f"این فیلتر پیدا نشد: {word}"
-        await message.answer(msg, reply_markup=kb_main_menu())
+        await message.answer(msg, reply_markup=kb_main_menu(is_owner))
+        return True
+
+    if state == "await_admin_add":
+        target_id, first_name, username = await parse_admin_target_from_message(message)
+        if target_id is None:
+            await message.answer(
+                "ID عددی ادمین را بفرست یا یک پیام/فوروارد از همان کاربر ارسال کن.\n"
+                "برای لغو: /cancel",
+                reply_markup=kb_back_home(),
+            )
+            return True
+
+        if target_id == OWNER_ID:
+            await db_set_admin_state(user_id, None)
+            await message.answer("این کاربر همان ادمین اصلی است.", reply_markup=kb_main_menu(is_owner))
+            return True
+
+        await db_add_admin(target_id, first_name, username)
+        await db_set_admin_state(user_id, None)
+        await message.answer(f"ادمین اضافه شد: {target_id}", reply_markup=kb_main_menu(is_owner))
+        return True
+
+    if state == "await_admin_remove":
+        target_id, _, _ = await parse_admin_target_from_message(message)
+        if target_id is None:
+            await message.answer(
+                "ID عددی ادمین را بفرست.\nبرای لغو: /cancel",
+                reply_markup=kb_back_home(),
+            )
+            return True
+
+        removed = await db_remove_admin(target_id)
+        await db_set_admin_state(user_id, None)
+        msg = "ادمین حذف شد." if removed else "این ادمین پیدا نشد یا قابل حذف نیست."
+        await message.answer(msg, reply_markup=kb_main_menu(is_owner))
         return True
 
     if text == "/start":
-        await message.answer("برای مدیریت بات /panel را بزن.", reply_markup=kb_main_menu())
+        await message.answer("برای مدیریت بات /panel را بزن.", reply_markup=kb_main_menu(is_owner))
         return True
 
     return False
@@ -534,26 +806,32 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
 # کال‌بک‌ها
 # =====================
 
-@router.callback_query(F.from_user.id == ADMIN_ID)
+@router.callback_query()
 async def callback_handler(callback: CallbackQuery):
+    if not callback.from_user or not await db_is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=False)
+        return
+
+    user_id = callback.from_user.id
+    is_owner = user_id == OWNER_ID
     data = callback.data or ""
     await callback.answer()
 
     if data == "menu:home":
-        await db_set_admin_state(None)
+        await db_set_admin_state(user_id, None)
         await callback.message.edit_text(
             "پنل مدیریت بات:\n"
-            "از دکمه‌ها برای تنظیم گروه، فیلترها، متن قوانین و کاربران ویژه استفاده کن.",
-            reply_markup=kb_main_menu(),
+            "از دکمه‌ها برای تنظیم گروه، فیلترها، متن قوانین، کاربران ویژه و ادمین‌ها استفاده کن.",
+            reply_markup=kb_main_menu(is_owner),
         )
         return
 
     if data == "menu:show_group":
-        await callback.message.edit_text(await fmt_group_text(), reply_markup=kb_main_menu())
+        await callback.message.edit_text(await fmt_group_text(), reply_markup=kb_main_menu(is_owner))
         return
 
     if data == "menu:set_group":
-        await db_set_admin_state("await_group_id")
+        await db_set_admin_state(user_id, "await_group_id")
         await callback.message.edit_text(
             "حالا ID گروه را بفرست یا یک پیام فوروارد شده از همان گروه را ارسال کن.\n"
             "برای لغو: /cancel"
@@ -561,7 +839,7 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     if data == "menu:rules":
-        await db_set_admin_state("await_rules_text")
+        await db_set_admin_state(user_id, "await_rules_text")
         await callback.message.edit_text(
             "متن کامل قوانین را همین‌جا بفرست.\n"
             "برای لغو: /cancel"
@@ -575,14 +853,21 @@ async def callback_handler(callback: CallbackQuery):
     if data == "menu:specials":
         await callback.message.edit_text(
             "تنظیم کاربران ویژه:\n"
-            "در گروهِ هدف روی پیام کاربر ریپلای کن و /special یا /unspecial بفرست.\n"
-            "کاربر ویژه فقط استیکر، گیف و ویدیو نوت را می‌تواند بفرستد.",
+            "در گروهِ هدف روی پیام کاربر ریپلای کن و «تنظیم ویژه» یا «حذف ویژه» بفرست.\n"
+            "کاربر ویژه می‌تواند استیکر، گیف و ویدیو نوت بفرستد.",
             reply_markup=kb_special_menu(),
         )
         return
 
+    if data == "menu:admins":
+        if not is_owner:
+            await callback.message.edit_text("فقط ادمین اصلی می‌تواند ادمین اضافه/حذف کند.", reply_markup=kb_main_menu(is_owner))
+            return
+        await callback.message.edit_text("مدیریت ادمین‌ها:", reply_markup=kb_admin_menu())
+        return
+
     if data == "filter:add":
-        await db_set_admin_state("await_filter_add")
+        await db_set_admin_state(user_id, "await_filter_add")
         await callback.message.edit_text(
             "کلمه یا عبارت فیلتر جدید را بفرست.\n"
             "برای لغو: /cancel"
@@ -594,7 +879,7 @@ async def callback_handler(callback: CallbackQuery):
         return
 
     if data == "filter:remove":
-        await db_set_admin_state("await_filter_remove")
+        await db_set_admin_state(user_id, "await_filter_remove")
         await callback.message.edit_text(
             "کلمه یا عبارت فیلتر را برای حذف بفرست.\n"
             "برای لغو: /cancel"
@@ -605,8 +890,8 @@ async def callback_handler(callback: CallbackQuery):
         await callback.message.edit_text(
             "روش استفاده:\n"
             "1) در گروه هدف روی پیام کاربر ریپلای کن.\n"
-            "2) /special بفرست تا ویژه شود.\n"
-            "3) /unspecial بفرست تا ویژه حذف شود.\n\n"
+            "2) «تنظیم ویژه» بفرست تا ویژه شود.\n"
+            "3) «حذف ویژه» بفرست تا ویژه حذف شود.\n\n"
             "کاربر ویژه می‌تواند:\n"
             "• sticker\n"
             "• animation (گیف)\n"
@@ -621,62 +906,85 @@ async def callback_handler(callback: CallbackQuery):
         await callback.message.edit_text(await fmt_specials_text(), reply_markup=kb_special_menu())
         return
 
+    if data == "admin:add":
+        if not is_owner:
+            await callback.message.edit_text("فقط ادمین اصلی می‌تواند ادمین اضافه کند.", reply_markup=kb_main_menu(is_owner))
+            return
+        await db_set_admin_state(user_id, "await_admin_add")
+        await callback.message.edit_text(
+            "ID عددی ادمین را بفرست یا یک پیام/فوروارد از همان کاربر ارسال کن.\n"
+            "برای لغو: /cancel"
+        )
+        return
+
+    if data == "admin:list":
+        if not is_owner:
+            await callback.message.edit_text("فقط ادمین اصلی می‌تواند لیست ادمین‌ها را ببیند.", reply_markup=kb_main_menu(is_owner))
+            return
+        await callback.message.edit_text(await fmt_admins_text(), reply_markup=kb_admin_menu())
+        return
+
+    if data == "admin:remove":
+        if not is_owner:
+            await callback.message.edit_text("فقط ادمین اصلی می‌تواند ادمین حذف کند.", reply_markup=kb_main_menu(is_owner))
+            return
+        await db_set_admin_state(user_id, "await_admin_remove")
+        await callback.message.edit_text(
+            "ID عددی ادمین را برای حذف بفرست.\n"
+            "برای لغو: /cancel"
+        )
+        return
+
 
 # =====================
-# دستورات ویژه
+# دستورات ویژه در گروه
 # =====================
 
 @router.message(Command("special"))
-async def special_add_handler(message: Message):
-    target_chat_id = await get_allowed_target_chat_id()
-    if message.chat.type == "private":
-        return
-    if target_chat_id is None or message.chat.id != target_chat_id:
-        return
-    if not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("برای ویژه کردن، باید روی پیام کاربر ریپلای کنی.")
-        return
-
-    user = message.reply_to_message.from_user
-    await db_add_special_user(user.id, user.first_name, user.username)
-    await message.reply(f"کاربر ویژه شد:\n{user.full_name} ({user.id})")
+async def special_add_slash_handler(message: Message):
+    await process_special_command(message, add=True)
 
 
 @router.message(Command("unspecial"))
-async def special_remove_handler(message: Message):
+async def special_remove_slash_handler(message: Message):
+    await process_special_command(message, add=False)
+
+
+async def process_special_command(message: Message, add: bool) -> None:
     target_chat_id = await get_allowed_target_chat_id()
     if message.chat.type == "private":
         return
     if target_chat_id is None or message.chat.id != target_chat_id:
         return
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not message.from_user or not await db_is_admin(message.from_user.id):
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("برای حذف ویژه، باید روی پیام کاربر ریپلای کنی.")
+        await message.reply("برای این کار، باید روی پیام کاربر ریپلای کنی.")
         return
 
     user = message.reply_to_message.from_user
-    removed = await db_remove_special_user(user.id)
-    if removed:
-        await message.reply(f"ویژه حذف شد:\n{user.full_name} ({user.id})")
+    if add:
+        await db_add_special_user(user.id, user.first_name, user.username)
+        await message.reply(f"کاربر ویژه شد:\n{user.full_name} ({user.id})")
     else:
-        await message.reply("این کاربر در لیست ویژه نبود.")
+        removed = await db_remove_special_user(user.id)
+        if removed:
+            await message.reply(f"ویژه حذف شد:\n{user.full_name} ({user.id})")
+        else:
+            await message.reply("این کاربر در لیست ویژه نبود.")
 
 
 # =====================
-# پردازش پیام‌ها
+# پردازش پیام‌ها در گروه
 # =====================
 
 @router.message()
 async def message_router(message: Message, bot: Bot):
-    # چت خصوصی: فقط ادمین اصلی
+    # چت خصوصی: فقط پنل ادمین‌ها
     if message.chat.type == "private":
         handled = await maybe_handle_admin_private(message, bot)
-        if not handled and message.from_user and message.from_user.id == ADMIN_ID:
-            if message.text:
-                await message.answer("برای مدیریت بات /panel را بزن.")
+        if not handled and message.from_user and await db_is_admin(message.from_user.id) and message.text:
+            await message.answer("برای مدیریت بات /panel را بزن.")
         return
 
     # فقط روی گروهِ تنظیم‌شده
@@ -684,41 +992,86 @@ async def message_router(message: Message, bot: Bot):
     if target_chat_id is None or message.chat.id != target_chat_id:
         return
 
-    if not message.from_user:
+    if not message.from_user or message.from_user.is_bot:
         return
 
-    # ادمین اصلی آزاد است
-    if message.from_user.id == ADMIN_ID:
-        return
-
-    # ادمین/creator گروه آزاد است
-    if await is_user_chat_admin(bot, message.chat.id, message.from_user.id):
-        return
+    # عضو را برای tag all ذخیره می‌کنیم
+    await db_add_group_member(
+        user_id=message.from_user.id,
+        first_name=message.from_user.first_name,
+        username=message.from_user.username,
+        full_name=message.from_user.full_name,
+    )
 
     text = message.text or ""
-    special = await db_is_special_user(message.from_user.id)
+    normalized = normalize_action_text(text)
 
-    # 1) قوانین: وقتی کسی فقط «قوانین» بنویسد، پاسخ ریپلای شود
+    # «قوانین» برای همه، حتی ادمین اصلی و ادمین‌های اضافه‌شده
     if text and is_rules_trigger(text):
         await message.reply(await get_rules_text())
         return
 
-    # 2) لینک‌ها
+    is_admin = await db_is_admin(message.from_user.id)
+
+    # «تگ» فقط برای ادمین‌ها
+    if is_admin and normalized == "تگ":
+        await send_tag_all(bot, message)
+        return
+
+    # تنظیم/حذف ویژه با ریپلای
+    if is_admin and normalized in {"تنظیم ویژه", "حذف ویژه"}:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply("برای این کار باید روی پیام کاربر ریپلای کنی.")
+            return
+
+        target_user = message.reply_to_message.from_user
+        if normalized == "تنظیم ویژه":
+            await db_add_special_user(target_user.id, target_user.first_name, target_user.username)
+            await message.reply(f"کاربر ویژه شد:\n{target_user.full_name} ({target_user.id})")
+        else:
+            removed = await db_remove_special_user(target_user.id)
+            if removed:
+                await message.reply(f"ویژه حذف شد:\n{target_user.full_name} ({target_user.id})")
+            else:
+                await message.reply("این کاربر در لیست ویژه نبود.")
+        return
+
+    # از اینجا به بعد، قوانین ضد پیام روی همه اعمال می‌شود
+    special = await db_is_special_user(message.from_user.id)
+
+    if has_disallowed_user_identifier(message):
+        await delete_message_safe(bot, message.chat.id, message.message_id)
+        return
+
     if has_disallowed_link(message):
         await delete_message_safe(bot, message.chat.id, message.message_id)
         return
 
-    # 3) فیلتر کلمات
     if await has_filter_match(message):
         await delete_message_safe(bot, message.chat.id, message.message_id)
         return
 
-    # 4) رسانه‌ها
     if is_blocked_media(message, special=special):
         await delete_message_safe(bot, message.chat.id, message.message_id)
         return
 
     # ویس و متن مجاز هستند
+
+
+async def send_tag_all(bot: Bot, message: Message) -> None:
+    rows = await db_list_group_members()
+    user_ids = [int(r["user_id"]) for r in rows if r["user_id"] != OWNER_ID]
+
+    if not user_ids:
+        await message.reply("هنوز عضوی برای منشن ثبت نشده است.")
+        return
+
+    chunks = chunk_user_ids_for_mentions(user_ids)
+    for i, chunk in enumerate(chunks, start=1):
+        body = format_hidden_mentions(chunk)
+        if i == len(chunks):
+            body = body + "\nتمامی اعضا منشن شدن"
+        await message.answer(body, parse_mode="HTML")
 
 
 # =====================
