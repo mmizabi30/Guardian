@@ -9,9 +9,12 @@ Guardian Telegram Bot (Web Service + Polling)
 - فقط در یک گروهِ تعیین‌شده فعال می‌شود
 - پیام‌های عکس / ویدیو / گیف / استیکر / ویدیو نوت را حذف می‌کند
 - فقط ویس را اجازه می‌دهد
-- لینک‌ها را حذف می‌کند، به‌جز لینک‌های start برای همین بات
+- هر لینک سایت/کانال/گروه حذف می‌شود مگر:
+    • فرستنده «ادمین اصلی» (OWNER) باشد
+    • لینک، لینک استارت خود همین ربات یا یکی از «ربات‌های مجاز» ثبت‌شده در پنل باشد
 - فیلتر کلمات دارد
 - کاربر ویژه با «تنظیم ویژه» / «حذف ویژه» (روی پیام کاربر با ریپلای)
+- کاربران ویژه و ادمین‌ها می‌توانند با فرستادن «تگ» همه‌ی اعضا را (به‌صورت فشرده در قالب یک کلمه‌ی کوچک) منشن کنند
 - ادمین اصلی + ادمین‌های اضافه‌شده از پنل خصوصی
 - ذخیره همه تنظیمات در Neon/PostgreSQL
 - بدون webhook اجرا می‌شود، ولی برای Render Web Service یک HTTP health endpoint دارد
@@ -55,6 +58,7 @@ PORT = int(os.getenv("PORT", "10000"))
 ALLOWED_BOT_USERNAME = os.getenv("ALLOWED_BOT_USERNAME", "").strip()
 
 MENTION_CHUNK_LIMIT = 3200  # برای امن ماندن زیر محدودیت تلگرام
+TAG_WORD = "همگی"  # کلمه‌ی کوچیکی که همه‌ی منشن‌ها داخلش مخفی می‌شن
 
 # =====================
 # لاگ
@@ -153,6 +157,14 @@ async def init_db() -> None:
                 admin_id BIGINT PRIMARY KEY,
                 state TEXT,
                 payload JSONB
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS allowed_bots (
+                username TEXT PRIMARY KEY,
+                added_at TIMESTAMPTZ DEFAULT NOW()
             )
             """
         )
@@ -345,6 +357,25 @@ async def db_list_group_members() -> list[asyncpg.Record]:
     )
 
 
+async def db_add_allowed_bot(username: str) -> bool:
+    username = username.lower()
+    try:
+        await db_exec("INSERT INTO allowed_bots(username) VALUES($1)", username)
+        return True
+    except asyncpg.UniqueViolationError:
+        return False
+
+
+async def db_remove_allowed_bot(username: str) -> bool:
+    result = await db_exec("DELETE FROM allowed_bots WHERE username = $1", username.lower())
+    return result.endswith(" 1")
+
+
+async def db_list_allowed_bots() -> list[str]:
+    rows = await db_fetch("SELECT username FROM allowed_bots ORDER BY added_at DESC")
+    return [r["username"] for r in rows]
+
+
 # =====================
 # ابزارها
 # =====================
@@ -368,6 +399,25 @@ def safe_int(text: str) -> Optional[int]:
         return int(str(text).strip())
     except Exception:
         return None
+
+
+def normalize_bot_username(text: str) -> Optional[str]:
+    """
+    ورودی می‌تواند یوزرنیم خام (@somebot / somebot) یا لینک t.me/somebot باشد.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    m = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})", t, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+
+    t = t.lstrip("@").strip()
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", t):
+        return t.lower()
+
+    return None
 
 
 def is_rules_trigger(text: str) -> bool:
@@ -410,31 +460,43 @@ def bot_username_for_links() -> str:
     return runtime_bot_username or ALLOWED_BOT_USERNAME or ""
 
 
-def is_allowed_bot_start_link(url: str) -> bool:
+async def is_allowed_bot_start_link(url: str) -> bool:
+    """
+    فقط لینک‌های استارت (t.me/username?start=...) خود ربات یا ربات‌های
+    ثبت‌شده در «ربات‌های مجاز» (پنل ادمین) مجاز هستند.
+    """
     if not url:
         return False
 
-    username = bot_username_for_links()
-    if not username:
-        return False
-
-    url = url.strip().rstrip(".,;!؟?)]}»\"'")
-    pattern = re.compile(
-        rf"^(?:https?://)?(?:t\.me|telegram\.me)/{re.escape(username)}\?start=[A-Za-z0-9_\-]+$",
+    url_clean = url.strip().rstrip(".,;!؟?)]}»\"'")
+    match = re.fullmatch(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})\?start=[A-Za-z0-9_\-]+",
+        url_clean,
         re.IGNORECASE,
     )
-    return bool(pattern.fullmatch(url))
+    if not match:
+        return False
+
+    username = match.group(1).lower()
+
+    own = bot_username_for_links().lower()
+    if own and username == own:
+        return True
+
+    allowed = await db_list_allowed_bots()
+    return username in {u.lower() for u in allowed if u}
 
 
-def has_disallowed_link(message: Message) -> bool:
+async def has_disallowed_link(message: Message) -> bool:
     for _, text, ent in iter_message_entities(message):
         if ent.type not in {MessageEntityType.URL, MessageEntityType.TEXT_LINK}:
             continue
         url = entity_url(text, ent)
         if not url:
             continue
-        if not (is_allowed_bot_start_link(url) or is_allowed_user_mention_link(url)):
-            return True
+        if await is_allowed_bot_start_link(url):
+            continue
+        return True
     return False
 
 
@@ -495,8 +557,17 @@ def is_blocked_media(message: Message, special: bool) -> bool:
     return False
 
 
-def format_hidden_mentions(user_ids: list[int]) -> str:
-    return " ".join(f'<a href="tg://user?id={uid}">•</a>' for uid in user_ids)
+def format_hidden_mentions(user_ids: list[int], word: str = TAG_WORD) -> str:
+    """
+    همه‌ی کاربران را به‌جای بولت‌های جدا با فاصله، داخل حروف یک کلمه‌ی کوچیک
+    مخفی می‌کند؛ خروجی یک بلوک فشرده و کوتاه به‌نظر می‌رسد نه یک ردیف بولت.
+    """
+    wlen = len(word)
+    parts = [
+        f'<a href="tg://user?id={uid}">{word[i % wlen]}</a>'
+        for i, uid in enumerate(user_ids)
+    ]
+    return "".join(parts)
 
 
 def chunk_user_ids_for_mentions(user_ids: list[int], max_chars: int = MENTION_CHUNK_LIMIT) -> list[list[int]]:
@@ -505,15 +576,14 @@ def chunk_user_ids_for_mentions(user_ids: list[int], max_chars: int = MENTION_CH
     current_len = 0
 
     for uid in user_ids:
-        token = f'<a href="tg://user?id={uid}">•</a>'
-        add_len = len(token) + 1
-        if current and current_len + add_len > max_chars:
+        token_len = len(f'<a href="tg://user?id={uid}">X</a>')
+        if current and current_len + token_len > max_chars:
             chunks.append(current)
             current = [uid]
-            current_len = len(token)
+            current_len = token_len
         else:
             current.append(uid)
-            current_len += add_len
+            current_len += token_len
 
     if current:
         chunks.append(current)
@@ -534,10 +604,21 @@ def kb_main_menu(is_owner: bool) -> InlineKeyboardMarkup:
     kb.button(text="تنظیمات فیلتر", callback_data="menu:filters")
     kb.button(text="متن قوانین", callback_data="menu:rules")
     kb.button(text="لیست کاربران ویژه", callback_data="menu:specials")
+    kb.button(text="ربات‌های مجاز", callback_data="menu:allowed_bots")
     if is_owner:
         kb.button(text="مدیریت ادمین‌ها", callback_data="menu:admins")
     kb.button(text="گروه فعال", callback_data="menu:show_group")
-    kb.adjust(2, 2, 1, 1)
+    kb.adjust(2, 2, 1, 1, 1)
+    return kb.as_markup()
+
+
+def kb_allowed_bots_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="افزودن ربات مجاز", callback_data="allowedbot:add")
+    kb.button(text="لیست ربات‌های مجاز", callback_data="allowedbot:list")
+    kb.button(text="حذف ربات مجاز", callback_data="allowedbot:remove")
+    kb.button(text="بازگشت", callback_data="menu:home")
+    kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -616,6 +697,13 @@ async def fmt_admins_text() -> str:
         role = "مالک اصلی" if a.get("owner") else "ادمین"
         lines.append(f"• {html_escape(name)} | {html_escape(username)} | {a['user_id']} | {role}")
     return "ادمین‌ها:\n" + "\n".join(lines)
+
+
+async def fmt_allowed_bots_text() -> str:
+    items = await db_list_allowed_bots()
+    if not items:
+        return "فعلاً هیچ ربات مجازی ثبت نشده است."
+    return "ربات‌های مجاز (لینک استارت‌شان حذف نمی‌شود):\n" + "\n".join(f"• @{u}" for u in items)
 
 
 async def get_allowed_target_chat_id() -> Optional[int]:
@@ -795,6 +883,37 @@ async def maybe_handle_admin_private(message: Message, bot: Bot) -> bool:
         await message.answer(msg, reply_markup=kb_main_menu(is_owner))
         return True
 
+    if state == "await_allowed_bot_add":
+        username = normalize_bot_username(text)
+        if not username:
+            await message.answer(
+                "یوزرنیم معتبر نیست. دوباره بفرست (مثلاً @somebot یا لینک t.me/somebot).\n"
+                "برای لغو: /cancel",
+                reply_markup=kb_back_home(),
+            )
+            return True
+
+        added = await db_add_allowed_bot(username)
+        await db_set_admin_state(user_id, None)
+        msg = f"ربات مجاز اضافه شد: @{username}" if added else f"این ربات از قبل مجاز است: @{username}"
+        await message.answer(msg, reply_markup=kb_main_menu(is_owner))
+        return True
+
+    if state == "await_allowed_bot_remove":
+        username = normalize_bot_username(text)
+        if not username:
+            await message.answer(
+                "یوزرنیم معتبر نیست. دوباره بفرست.\nبرای لغو: /cancel",
+                reply_markup=kb_back_home(),
+            )
+            return True
+
+        removed = await db_remove_allowed_bot(username)
+        await db_set_admin_state(user_id, None)
+        msg = f"ربات مجاز حذف شد: @{username}" if removed else f"این ربات در لیست مجازها پیدا نشد: @{username}"
+        await message.answer(msg, reply_markup=kb_main_menu(is_owner))
+        return True
+
     if text == "/start":
         await message.answer("برای مدیریت بات /panel را بزن.", reply_markup=kb_main_menu(is_owner))
         return True
@@ -864,6 +983,35 @@ async def callback_handler(callback: CallbackQuery):
             await callback.message.edit_text("فقط ادمین اصلی می‌تواند ادمین اضافه/حذف کند.", reply_markup=kb_main_menu(is_owner))
             return
         await callback.message.edit_text("مدیریت ادمین‌ها:", reply_markup=kb_admin_menu())
+        return
+
+    if data == "menu:allowed_bots":
+        await callback.message.edit_text(
+            "مدیریت ربات‌های مجاز:\n"
+            "لینک استارت (t.me/username?start=...) ربات‌های زیر حذف نمی‌شود.\n"
+            "لینک استارت خود همین ربات همیشه مجاز است.",
+            reply_markup=kb_allowed_bots_menu(),
+        )
+        return
+
+    if data == "allowedbot:add":
+        await db_set_admin_state(user_id, "await_allowed_bot_add")
+        await callback.message.edit_text(
+            "یوزرنیم ربات مورد نظر را بفرست (مثلاً @somebot یا somebot یا لینک t.me/somebot).\n"
+            "برای لغو: /cancel"
+        )
+        return
+
+    if data == "allowedbot:list":
+        await callback.message.edit_text(await fmt_allowed_bots_text(), reply_markup=kb_allowed_bots_menu())
+        return
+
+    if data == "allowedbot:remove":
+        await db_set_admin_state(user_id, "await_allowed_bot_remove")
+        await callback.message.edit_text(
+            "یوزرنیم رباتی که می‌خواهی از لیست مجاز حذف شود را بفرست.\n"
+            "برای لغو: /cancel"
+        )
         return
 
     if data == "filter:add":
@@ -1012,13 +1160,14 @@ async def message_router(message: Message, bot: Bot):
         return
 
     is_admin = await db_is_admin(message.from_user.id)
+    special = await db_is_special_user(message.from_user.id)
 
-    # «تگ» فقط برای ادمین‌ها
-    if is_admin and normalized == "تگ":
+    # «تگ» برای ادمین‌ها و کاربران ویژه
+    if (is_admin or special) and normalized == "تگ":
         await send_tag_all(bot, message)
         return
 
-    # تنظیم/حذف ویژه با ریپلای
+    # تنظیم/حذف ویژه با ریپلای (فقط ادمین‌ها)
     if is_admin and normalized in {"تنظیم ویژه", "حذف ویژه"}:
         if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply("برای این کار باید روی پیام کاربر ریپلای کنی.")
@@ -1037,13 +1186,14 @@ async def message_router(message: Message, bot: Bot):
         return
 
     # از اینجا به بعد، قوانین ضد پیام روی همه اعمال می‌شود
-    special = await db_is_special_user(message.from_user.id)
+    is_owner_sender = message.from_user.id == OWNER_ID
 
     if has_disallowed_user_identifier(message):
         await delete_message_safe(bot, message.chat.id, message.message_id)
         return
 
-    if has_disallowed_link(message):
+    # لینک‌ها: حذف می‌شوند مگر لینک استارت ربات مجاز باشد یا فرستنده ادمین اصلی باشد
+    if not is_owner_sender and await has_disallowed_link(message):
         await delete_message_safe(bot, message.chat.id, message.message_id)
         return
 
@@ -1067,10 +1217,8 @@ async def send_tag_all(bot: Bot, message: Message) -> None:
         return
 
     chunks = chunk_user_ids_for_mentions(user_ids)
-    for i, chunk in enumerate(chunks, start=1):
+    for chunk in chunks:
         body = format_hidden_mentions(chunk)
-        if i == len(chunks):
-            body = body + "\nتمامی اعضا منشن شدن"
         await message.answer(body, parse_mode="HTML")
 
 
