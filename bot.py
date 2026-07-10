@@ -58,7 +58,8 @@ PORT = int(os.getenv("PORT", "10000"))
 ALLOWED_BOT_USERNAME = os.getenv("ALLOWED_BOT_USERNAME", "").strip()
 
 MENTION_CHUNK_LIMIT = 3200  # برای امن ماندن زیر محدودیت تلگرام
-TAG_WORD = "همگی"  # کلمه‌ی کوچیکی که همه‌ی منشن‌ها داخلش مخفی می‌شن
+TAG_SENTENCE_WORDS = ["تمامی", "کاربر", "ها", "درحال", "تگ", "شن👀"]  # جمله‌ی نمایشی تگ
+TAG_SEPARATOR = "\u200c"  # نیم‌فاصله (ZWNJ) - همون کاراکتر جداکننده‌ی کیبورد فارسی
 
 # =====================
 # لاگ
@@ -557,38 +558,51 @@ def is_blocked_media(message: Message, special: bool) -> bool:
     return False
 
 
-def format_hidden_mentions(user_ids: list[int], word: str = TAG_WORD) -> str:
+def build_tag_messages(user_ids: list[int], max_chars: int = MENTION_CHUNK_LIMIT) -> list[str]:
     """
-    همه‌ی کاربران را به‌جای بولت‌های جدا با فاصله، داخل حروف یک کلمه‌ی کوچیک
-    مخفی می‌کند؛ خروجی یک بلوک فشرده و کوتاه به‌نظر می‌رسد نه یک ردیف بولت.
+    برای هر پیام تگ:
+    - اول کلمات جمله‌ی «تمامی کاربر ها درحال تگ شن👀» هر کدام به یک کاربر منشن می‌شوند
+      (همون کلمات با فاصله‌ی عادی بین‌شون، پیام کاملاً طبیعی و خوانا دیده می‌شه).
+    - بعد، با کاراکتر نیم‌فاصله (ZWNJ) که نامرئیه، بقیه‌ی کاربران هم به همون پیام
+      اضافه می‌شن (هر نیم‌فاصله = منشن یک کاربر) تا سقف مجاز پیام پر بشه.
+    - وقتی یک پیام پر شد، بقیه‌ی کاربران می‌رن توی پیام تگ بعدی (دوباره با همون جمله).
+    این‌طوری تلگرام پیام رو رد نمی‌کنه (چون فقط از کاراکتر جداکننده تشکیل نشده)
+    و ظاهر پیام هم کاملاً کوتاه و طبیعی می‌مونه.
     """
-    wlen = len(word)
-    parts = [
-        f'<a href="tg://user?id={uid}">{word[i % wlen]}</a>'
-        for i, uid in enumerate(user_ids)
-    ]
-    return "".join(parts)
+    messages: list[str] = []
+    idx = 0
+    total = len(user_ids)
 
+    while idx < total:
+        word_tokens: list[str] = []
+        for word in TAG_SENTENCE_WORDS:
+            if idx < total:
+                uid = user_ids[idx]
+                idx += 1
+                word_tokens.append(f'<a href="tg://user?id={uid}">{word}</a>')
+            else:
+                word_tokens.append(word)
 
-def chunk_user_ids_for_mentions(user_ids: list[int], max_chars: int = MENTION_CHUNK_LIMIT) -> list[list[int]]:
-    chunks: list[list[int]] = []
-    current: list[int] = []
-    current_len = 0
+        body = " ".join(word_tokens)
+        current_len = len(body)
 
-    for uid in user_ids:
-        token_len = len(f'<a href="tg://user?id={uid}">X</a>')
-        if current and current_len + token_len > max_chars:
-            chunks.append(current)
-            current = [uid]
-            current_len = token_len
-        else:
-            current.append(uid)
+        filler_parts: list[str] = []
+        while idx < total:
+            uid = user_ids[idx]
+            token = f'<a href="tg://user?id={uid}">{TAG_SEPARATOR}</a>'
+            token_len = len(token)
+            if current_len + token_len > max_chars:
+                break
+            filler_parts.append(token)
             current_len += token_len
+            idx += 1
 
-    if current:
-        chunks.append(current)
+        if filler_parts:
+            body += "".join(filler_parts)
 
-    return chunks
+        messages.append(body)
+
+    return messages
 
 
 async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
@@ -1216,9 +1230,7 @@ async def send_tag_all(bot: Bot, message: Message) -> None:
         await message.reply("هنوز عضوی برای منشن ثبت نشده است.")
         return
 
-    chunks = chunk_user_ids_for_mentions(user_ids)
-    for chunk in chunks:
-        body = format_hidden_mentions(chunk)
+    for body in build_tag_messages(user_ids):
         await message.answer(body, parse_mode="HTML")
 
 
