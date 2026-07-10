@@ -57,7 +57,7 @@ PORT = int(os.getenv("PORT", "10000"))
 # اگر خود بات بالا آمد، یوزرنیمش از getMe خوانده می‌شود؛ این فقط fallback است
 ALLOWED_BOT_USERNAME = os.getenv("ALLOWED_BOT_USERNAME", "").strip()
 
-MENTION_CHUNK_LIMIT = 3200  # برای امن ماندن زیر محدودیت تلگرام
+MENTION_CHUNK_LIMIT = 4050  # سقف واقعی پیام تلگرام ۴۰۹۶ کاراکتره؛ این عدد با کمی حاشیه‌ی امن نزدیک به همونه
 TAG_SENTENCE_WORDS = ["تمامی", "کاربر", "ها", "درحال", "تگ", "شن👀"]  # جمله‌ی نمایشی تگ
 TAG_SEPARATOR = "\u200c"  # نیم‌فاصله (ZWNJ) - همون کاراکتر جداکننده‌ی کیبورد فارسی
 
