@@ -449,9 +449,23 @@ def iter_message_entities(message: Message):
             yield ("caption", caption, ent)
 
 
+def extract_entity_text(text: str, offset: int, length: int) -> str:
+    """
+    آفست و طول entity های تلگرام همیشه بر اساس واحدهای UTF-16 هستن، نه
+    کاراکترهای پایتون. اگر قبل از یک entity ایموجی یا هر کاراکتر خارج از
+    BMP باشه (که در UTF-16 دو واحدی حساب می‌شه ولی در پایتون یک کاراکتره)،
+    برش ساده‌ی رشته با اندیس پایتون جابه‌جا می‌شه و متن اشتباهی استخراج
+    می‌کنه. این تابع درست، بر اساس UTF-16 برش می‌زنه.
+    """
+    encoded = text.encode("utf-16-le")
+    start = offset * 2
+    end = (offset + length) * 2
+    return encoded[start:end].decode("utf-16-le", errors="ignore")
+
+
 def entity_url(text: str, ent) -> Optional[str]:
     if ent.type == MessageEntityType.URL:
-        return text[ent.offset : ent.offset + ent.length]
+        return extract_entity_text(text, ent.offset, ent.length)
     if ent.type == MessageEntityType.TEXT_LINK:
         return getattr(ent, "url", None)
     return None
